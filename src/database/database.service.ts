@@ -1,8 +1,16 @@
-import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
-import { Pool, QueryResultRow } from 'pg';
+import {
+  Injectable,
+  OnModuleDestroy,
+  OnModuleInit,
+  Logger,
+} from '@nestjs/common';
+
+import { Pool, PoolClient, QueryResultRow } from 'pg';
 
 @Injectable()
 export class DatabaseService implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger(DatabaseService.name);
+
   private readonly pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     max: 20,
@@ -10,36 +18,46 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
 
   async onModuleInit() {
     await this.pool.query('SELECT 1');
-    //g('PostgreSQL connected successfully');
+    this.logger.log('PostgreSQL connected successfully');
   }
 
   async onModuleDestroy() {
     await this.pool.end();
+    this.logger.log('PostgreSQL connection pool closed');
   }
 
+  // Normal queries
   query<T extends QueryResultRow = QueryResultRow>(
     sql: string,
-    params: any[] = [],
+    params: unknown[] = [],
   ) {
-    //g('\n========== DATABASE: QUERY START ==========');
-    //g('[Database] SQL:', sql);
-    //g('[Database] Parameters:', params);
+    return this.pool.query<T>(sql, params);
+  }
 
-    return this.pool
-      .query<T>(sql, params)
-      .then((result) => {
-        //g('[Database] Query completed successfully');
-        //g('[Database] Rows returned:', result.rows);
-        //g('[Database] Row count:', result.rowCount);
-        //g('========== DATABASE: QUERY END ==========\n');
+  // Transaction support
+  async transaction<T>(
+    callback: (client: PoolClient) => Promise<T>,
+  ): Promise<T> {
+    const client = await this.pool.connect();
 
-        return result;
-      })
-      .catch((error) => {
-        console.error('[Database] Query FAILED:', error.message);
-        console.error('[Database] PostgreSQL error code:', error.code);
+    try {
+      await client.query('BEGIN');
 
-        throw error;
-      });
+      const result = await callback(client);
+
+      await client.query('COMMIT');
+
+      return result;
+    } catch (error) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackError) {
+        this.logger.error('Transaction rollback failed', rollbackError);
+      }
+
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 }
