@@ -23,3 +23,19 @@ SELECT
 FROM provider_webhook_events
 ORDER BY received_at DESC
 LIMIT 10;
+
+SELECT
+    event_type,
+    provider_message_id,
+    event_key,
+    received_at,
+    processed_at
+FROM provider_webhook_events
+ORDER BY received_at DESC
+LIMIT 10;
+
+
+SELECT id, status, provider_message_id, last_error
+FROM notifications
+ORDER BY created_at DESC
+LIMIT 5;

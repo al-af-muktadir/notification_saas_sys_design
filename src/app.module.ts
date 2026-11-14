@@ -8,6 +8,7 @@ import { HealthModule } from './modules/health/health.module.js';
 import { NotificationsModule } from './modules/notifications/notifications.module.js';
 import { DatabaseModule } from './database/database.module.js';
 import { RabbitMQModule } from './modules/rabbitmq/rabbitmq.module.js';
+import { AuthModule } from './modules/auth/auth.module.js';
 
 export const { ObserveModule, ObserveInstrument } = createObserveModule();
 
@@ -25,6 +26,7 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
     NotificationsModule,
     DatabaseModule,
     RabbitMQModule,
+    AuthModule,
   ],
   controllers: [AppController],
   providers: [AppService],
