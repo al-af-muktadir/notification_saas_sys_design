@@ -73,6 +73,8 @@ export class NotificationsService {
   constructor(private readonly database: DatabaseService) {}
 
   // Create a single notification.
+
+  // Create a single notification.
   async create(
     input: CreateNotificationDto,
     idempotencyKey: string,
@@ -106,104 +108,109 @@ export class NotificationsService {
       )
       .digest('hex');
 
-    const result = await this.database.transaction(async (client) => {
-      // 1. Create the notification for the authenticated tenant.
-      const notificationResult = await client.query(
-        `INSERT INTO notifications
+    const result = await this.database.tenantTransaction(
+      tenantId,
+      async (client) => {
+        // 1. Create the notification.
+        const notificationResult = await client.query(
+          `INSERT INTO notifications
           (tenant_id, channel, recipient, message)
-         VALUES ($1, $2, $3, $4)
-         RETURNING id, tenant_id, channel, recipient, message,
-                   status, created_at`,
-        [tenantId, input.channel, input.recipient, input.message],
-      );
-
-      const notification = notificationResult.rows[0];
-
-      // 2. Register the idempotency key.
-      const idempotencyResult = await client.query(
-        `INSERT INTO idempotency_records
-          (tenant_id, notification_id, idempotency_key, request_hash)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (tenant_id, idempotency_key)
-         DO NOTHING
-         RETURNING id`,
-        [tenantId, notification.id, key, requestHash],
-      );
-
-      // 3. If the key already exists, remove the newly created
-      //    notification and return the original result.
-      if (idempotencyResult.rows.length === 0) {
-        await client.query(
-          `DELETE FROM notifications
-           WHERE id = $1 AND tenant_id = $2`,
-          [notification.id, tenantId],
+          VALUES ($1, $2, $3, $4)
+          RETURNING id, tenant_id, channel, recipient, message,
+                    status, created_at`,
+          [tenantId, input.channel, input.recipient, input.message],
         );
 
-        const existingResult = await client.query(
-          `SELECT
-              n.id,
-              n.tenant_id,
-              n.channel,
-              n.recipient,
-              n.message,
-              n.status,
-              n.created_at,
-              i.request_hash
-           FROM idempotency_records i
-           JOIN notifications n ON n.id = i.notification_id
-           WHERE i.tenant_id = $1
-             AND i.idempotency_key = $2`,
-          [tenantId, key],
+        const notification = notificationResult.rows[0];
+
+        // 2. Register the key in the shared idempotency table.
+        const idempotencyResult = await client.query(
+          `INSERT INTO idempotency_keys
+          (tenant_id, idempotency_key, operation_type, request_hash, resource_id)
+          VALUES ($1, $2, 'single', $3, $4)
+          ON CONFLICT (tenant_id, idempotency_key)
+          DO NOTHING
+          RETURNING id`,
+          [tenantId, key, requestHash, notification.id],
         );
 
-        const existing = existingResult.rows[0];
-
-        if (!existing) {
-          throw new Error('Existing idempotency record not found.');
-        }
-
-        if (existing.request_hash !== requestHash) {
-          throw new ConflictException(
-            'Idempotency key was already used with a different request.',
+        // 3. Handle an existing key.
+        if (idempotencyResult.rows.length === 0) {
+          await client.query(
+            `DELETE FROM notifications
+             WHERE id = $1 AND tenant_id = $2`,
+            [notification.id, tenantId],
           );
+
+          const existingResult = await client.query(
+            `SELECT operation_type, request_hash, resource_id
+             FROM idempotency_keys
+             WHERE tenant_id = $1
+               AND idempotency_key = $2`,
+            [tenantId, key],
+          );
+
+          const existing = existingResult.rows[0];
+
+          if (!existing) {
+            throw new Error('Existing idempotency record not found.');
+          }
+
+          if (existing.operation_type !== 'single') {
+            throw new ConflictException(
+              'This idempotency key has already been used for a bulk request.',
+            );
+          }
+
+          if (existing.request_hash !== requestHash) {
+            throw new ConflictException(
+              'Idempotency key was already used with a different request.',
+            );
+          }
+
+          const existingNotificationResult = await client.query(
+            `SELECT
+              id, tenant_id, channel, recipient, message, status, created_at
+             FROM notifications
+             WHERE id = $1 AND tenant_id = $2`,
+            [existing.resource_id, tenantId],
+          );
+
+          const existingNotification = existingNotificationResult.rows[0];
+
+          if (!existingNotification) {
+            throw new Error('Original notification was not found.');
+          }
+
+          return {
+            duplicate: true,
+            notification: existingNotification,
+          };
         }
+
+        // 4. Create the outbox event in the same transaction.
+        await client.query(
+          `INSERT INTO outbox_events
+          (notification_id, routing_key, payload)
+          VALUES ($1, $2, $3::jsonb)`,
+          [
+            notification.id,
+            'notifications.email',
+            JSON.stringify({
+              id: notification.id,
+              channel: notification.channel,
+              recipient: notification.recipient,
+              message: notification.message,
+            }),
+          ],
+        );
 
         return {
-          duplicate: true,
-          notification: {
-            id: existing.id,
-            tenant_id: existing.tenant_id,
-            channel: existing.channel,
-            recipient: existing.recipient,
-            message: existing.message,
-            status: existing.status,
-            created_at: existing.created_at,
-          },
+          duplicate: false,
+          notification,
         };
-      }
-
-      // 4. Create the outbox event in the same transaction.
-      await client.query(
-        `INSERT INTO outbox_events
-          (notification_id, routing_key, payload)
-         VALUES ($1, $2, $3::jsonb)`,
-        [
-          notification.id,
-          'notifications.email',
-          JSON.stringify({
-            id: notification.id,
-            channel: notification.channel,
-            recipient: notification.recipient,
-            message: notification.message,
-          }),
-        ],
-      );
-
-      return {
-        duplicate: false,
-        notification,
-      };
-    });
+      },
+    );
 
     if (result.duplicate) {
       this.logger.warn(
@@ -231,6 +238,8 @@ export class NotificationsService {
   }
 
   // Create multiple notifications in one bulk request.
+
+  // Create multiple notifications in one bulk request.
   async createBulk(
     input: CreateBulkNotificationDto,
     idempotencyKey: string,
@@ -254,7 +263,6 @@ export class NotificationsService {
       );
     }
 
-    // Hash the complete bulk request.
     const requestHash = createHash('sha256')
       .update(
         JSON.stringify({
@@ -266,90 +274,151 @@ export class NotificationsService {
       )
       .digest('hex');
 
-    const response = await this.database.transaction(async (client) => {
-      // 1. Register the complete bulk request.
-      const bulkRequestResult = await client.query(
-        `INSERT INTO bulk_requests
+    const response = await this.database.tenantTransaction(
+      tenantId,
+      async (client) => {
+        // 1. Create the bulk request.
+        const bulkRequestResult = await client.query(
+          `INSERT INTO bulk_requests
           (tenant_id, idempotency_key, request_hash)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (tenant_id, idempotency_key)
-         DO NOTHING
-         RETURNING id`,
-        [tenantId, key, requestHash],
-      );
-
-      // 2. Handle a previously submitted bulk request.
-      if (bulkRequestResult.rows.length === 0) {
-        const existingResult = await client.query(
-          `SELECT id, request_hash, response
-           FROM bulk_requests
-           WHERE tenant_id = $1
-             AND idempotency_key = $2
-           FOR UPDATE`,
-          [tenantId, key],
+          VALUES ($1, $2, $3)
+          ON CONFLICT (tenant_id, idempotency_key)
+          DO NOTHING
+          RETURNING id`,
+          [tenantId, key, requestHash],
         );
 
-        const existing = existingResult.rows[0];
+        // 2. If this bulk key already exists, retrieve its shared record.
+        if (bulkRequestResult.rows.length === 0) {
+          const existingResult = await client.query(
+            `SELECT operation_type, request_hash, resource_id
+             FROM idempotency_keys
+             WHERE tenant_id = $1
+               AND idempotency_key = $2`,
+            [tenantId, key],
+          );
 
-        if (!existing) {
-          throw new Error('Existing bulk request not found.');
+          const existing = existingResult.rows[0];
+
+          if (!existing) {
+            throw new Error('Existing idempotency record not found.');
+          }
+
+          if (existing.operation_type !== 'bulk') {
+            throw new ConflictException(
+              'This idempotency key has already been used for a single notification.',
+            );
+          }
+
+          if (existing.request_hash !== requestHash) {
+            throw new ConflictException(
+              'Idempotency key was already used with a different bulk request.',
+            );
+          }
+
+          const existingBulkResult = await client.query(
+            `SELECT response
+             FROM bulk_requests
+             WHERE id = $1 AND tenant_id = $2`,
+            [existing.resource_id, tenantId],
+          );
+
+          const existingBulk = existingBulkResult.rows[0];
+
+          if (!existingBulk?.response) {
+            throw new Error('Original bulk response was not found.');
+          }
+
+          return {
+            ...(existingBulk.response as BulkResponse),
+            duplicate: true,
+          };
         }
 
-        if (existing.request_hash !== requestHash) {
+        const bulkRequestId = bulkRequestResult.rows[0].id;
+
+        // 3. Register this key in the shared namespace.
+        const idempotencyResult = await client.query(
+          `INSERT INTO idempotency_keys
+          (tenant_id, idempotency_key, operation_type, request_hash, resource_id)
+          VALUES ($1, $2, 'bulk', $3, $4)
+          ON CONFLICT (tenant_id, idempotency_key)
+          DO NOTHING
+          RETURNING id`,
+          [tenantId, key, requestHash, bulkRequestId],
+        );
+
+        // 4. The key may already belong to the single endpoint.
+        if (idempotencyResult.rows.length === 0) {
+          await client.query(
+            `DELETE FROM bulk_requests
+             WHERE id = $1 AND tenant_id = $2`,
+            [bulkRequestId, tenantId],
+          );
+
+          const existingResult = await client.query(
+            `SELECT operation_type
+             FROM idempotency_keys
+             WHERE tenant_id = $1
+               AND idempotency_key = $2`,
+            [tenantId, key],
+          );
+
+          const existing = existingResult.rows[0];
+
+          if (!existing) {
+            throw new Error('Existing idempotency record not found.');
+          }
+
+          if (existing.operation_type !== 'bulk') {
+            throw new ConflictException(
+              'This idempotency key has already been used for a single notification.',
+            );
+          }
+
           throw new ConflictException(
-            'Idempotency key was already used with a different bulk request.',
+            'This idempotency key is already registered for another bulk request.',
           );
         }
 
-        return {
-          ...(existing.response as BulkResponse),
-          duplicate: true,
-        };
-      }
+        const results: BulkRecipientResult[] = [];
+        const seenRecipients = new Set<string>();
 
-      const bulkRequestId = bulkRequestResult.rows[0].id;
+        let acceptedCount = 0;
+        let rejectedCount = 0;
 
-      const results: BulkRecipientResult[] = [];
-      const seenRecipients = new Set<string>();
+        // 5. Process each recipient independently.
+        for (const [index, recipient] of input.recipients.entries()) {
+          const emailValidation = z.string().email().safeParse(recipient);
+          const normalizedRecipient = recipient.toLowerCase();
+          const errors: string[] = [];
 
-      let acceptedCount = 0;
-      let rejectedCount = 0;
+          if (!emailValidation.success) {
+            errors.push('Invalid email address.');
+          }
 
-      // 3. Process each recipient independently.
-      for (const [index, recipient] of input.recipients.entries()) {
-        const emailValidation = z.string().email().safeParse(recipient);
+          if (seenRecipients.has(normalizedRecipient)) {
+            errors.push('Duplicate recipient in this bulk request.');
+          }
 
-        const normalizedRecipient = recipient.toLowerCase();
+          seenRecipients.add(normalizedRecipient);
 
-        const errors: string[] = [];
+          if (errors.length > 0) {
+            rejectedCount++;
 
-        if (!emailValidation.success) {
-          errors.push('Invalid email address.');
-        }
+            results.push({
+              index,
+              recipient,
+              status: 'rejected',
+              errors,
+            });
 
-        if (seenRecipients.has(normalizedRecipient)) {
-          errors.push('Duplicate recipient in this bulk request.');
-        }
+            continue;
+          }
 
-        seenRecipients.add(normalizedRecipient);
-
-        // Invalid recipient: report rejection and continue.
-        if (errors.length > 0) {
-          rejectedCount++;
-
-          results.push({
-            index,
-            recipient,
-            status: 'rejected',
-            errors,
-          });
-
-          continue;
-        }
-
-        // 4. Create an individual notification.
-        const notificationResult = await client.query(
-          `INSERT INTO notifications
+          // 6. Create an individual notification.
+          const notificationResult = await client.query(
+            `INSERT INTO notifications
             (
               tenant_id,
               channel,
@@ -358,80 +427,81 @@ export class NotificationsService {
               notification_type,
               bulk_request_id
             )
-           VALUES ($1, $2, $3, $4, $5, $6)
-           RETURNING id, status, created_at`,
-          [
-            tenantId,
-            input.channel,
-            recipient,
-            input.message,
-            input.notificationType,
-            bulkRequestId,
-          ],
-        );
-
-        const notification = notificationResult.rows[0];
-
-        // 5. Create its outbox event in the same transaction.
-        await client.query(
-          `INSERT INTO outbox_events
-            (notification_id, routing_key, payload)
-           VALUES ($1, $2, $3::jsonb)`,
-          [
-            notification.id,
-            'notifications.email',
-            JSON.stringify({
-              id: notification.id,
-              channel: input.channel,
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id`,
+            [
+              tenantId,
+              input.channel,
               recipient,
-              message: input.message,
-            }),
-          ],
-        );
+              input.message,
+              input.notificationType,
+              bulkRequestId,
+            ],
+          );
 
-        acceptedCount++;
+          const notification = notificationResult.rows[0];
 
-        results.push({
-          index,
-          recipient,
-          status: 'accepted',
-          notificationId: notification.id,
-        });
-      }
+          // 7. Create its outbox event.
+          await client.query(
+            `INSERT INTO outbox_events
+            (notification_id, routing_key, payload)
+            VALUES ($1, $2, $3::jsonb)`,
+            [
+              notification.id,
+              'notifications.email',
+              JSON.stringify({
+                id: notification.id,
+                channel: input.channel,
+                recipient,
+                message: input.message,
+              }),
+            ],
+          );
 
-      // 6. Build the final bulk response.
-      const finalResponse: BulkResponse = {
-        status: acceptedCount > 0 ? 'accepted' : 'rejected',
-        message:
-          acceptedCount > 0
-            ? 'Bulk request processed. Accepted notifications are queued for publishing.'
-            : 'No valid recipients were accepted.',
-        bulkRequestId,
-        acceptedCount,
-        rejectedCount,
-        duplicate: false,
-        results,
-      };
+          acceptedCount++;
 
-      // 7. Save the response for future duplicate requests.
-      await client.query(
-        `UPDATE bulk_requests
-         SET accepted_count = $2,
-             rejected_count = $3,
-             response = $4::jsonb
-         WHERE id = $1
-           AND tenant_id = $5`,
-        [
+          results.push({
+            index,
+            recipient,
+            status: 'accepted',
+            notificationId: notification.id,
+          });
+        }
+
+        // 8. Build the final response.
+        const finalResponse: BulkResponse = {
+          status: acceptedCount > 0 ? 'accepted' : 'rejected',
+          message:
+            acceptedCount > 0
+              ? 'Bulk request processed. Accepted notifications are queued for publishing.'
+              : 'No valid recipients were accepted.',
           bulkRequestId,
           acceptedCount,
           rejectedCount,
-          JSON.stringify(finalResponse),
-          tenantId,
-        ],
-      );
+          duplicate: false,
+          results,
+        };
 
-      return finalResponse;
-    });
+        // 9. Save the response for future duplicate requests.
+        await client.query(
+          `UPDATE bulk_requests
+           SET accepted_count = $2,
+               rejected_count = $3,
+               response = $4::jsonb
+           WHERE id = $1
+             AND tenant_id = $5`,
+          [
+            bulkRequestId,
+            acceptedCount,
+            rejectedCount,
+            JSON.stringify(finalResponse),
+            tenantId,
+          ],
+        );
+
+        return finalResponse;
+      },
+    );
 
     this.logger.log(
       `Bulk request ${response.bulkRequestId}: ` +
@@ -451,110 +521,106 @@ export class NotificationsService {
       channel?: string;
     },
   ) {
-    const values: unknown[] = [tenantId];
+    return this.database.tenantTransaction(tenantId, async (client) => {
+      const values: unknown[] = [tenantId];
+      const conditions = ['tenant_id = $1'];
 
-    const conditions = ['tenant_id = $1'];
+      if (query.status) {
+        values.push(query.status);
+        conditions.push(`status = $${values.length}`);
+      }
 
-    // Optional status filter.
-    if (query.status) {
-      values.push(query.status);
-      conditions.push(`status = $${values.length}`);
-    }
+      if (query.channel) {
+        values.push(query.channel);
+        conditions.push(`channel = $${values.length}`);
+      }
 
-    // Optional channel filter.
-    if (query.channel) {
-      values.push(query.channel);
-      conditions.push(`channel = $${values.length}`);
-    }
+      if (query.cursor) {
+        const cursor = decodeCursor(query.cursor);
 
-    // Cursor condition.
-    if (query.cursor) {
-      const cursor = decodeCursor(query.cursor);
+        values.push(cursor.createdAt);
+        const timestampIndex = values.length;
 
-      values.push(cursor.createdAt);
-      const timestampIndex = values.length;
+        values.push(cursor.id);
+        const idIndex = values.length;
 
-      values.push(cursor.id);
-      const idIndex = values.length;
+        conditions.push(
+          `(created_at, id) < ($${timestampIndex}::timestamptz, $${idIndex}::uuid)`,
+        );
+      }
 
-      conditions.push(
-        `(created_at, id) < ($${timestampIndex}::timestamptz, $${idIndex}::uuid)`,
+      values.push(query.limit + 1);
+
+      const result = await client.query(
+        `
+        SELECT
+          id,
+          channel,
+          recipient,
+          message,
+          notification_type,
+          status,
+          created_at
+         
+        FROM notifications
+        WHERE ${conditions.join(' AND ')}
+        ORDER BY created_at DESC, id DESC
+        LIMIT $${values.length}
+      `,
+        values,
       );
-    }
 
-    // Fetch one extra record to determine whether another page exists.
-    values.push(query.limit + 1);
+      const hasMore = result.rows.length > query.limit;
+      const data = result.rows.slice(0, query.limit);
+      const lastNotification = data[data.length - 1];
 
-    const result = await this.database.query(
-      `
-    SELECT
-      id,
-      channel,
-      recipient,
-      message,
-      notification_type,
-      status,
-      created_at,
-      updated_at
-    FROM notifications
-    WHERE ${conditions.join(' AND ')}
-    ORDER BY created_at DESC, id DESC
-    LIMIT $${values.length}
-    `,
-      values,
-    );
+      const nextCursor =
+        hasMore && lastNotification
+          ? encodeCursor({
+              createdAt: new Date(lastNotification.created_at).toISOString(),
+              id: lastNotification.id,
+            })
+          : null;
 
-    const hasMore = result.rows.length > query.limit;
-
-    const data = result.rows.slice(0, query.limit);
-
-    const lastNotification = data[data.length - 1];
-
-    const nextCursor =
-      hasMore && lastNotification
-        ? encodeCursor({
-            createdAt: new Date(lastNotification.created_at).toISOString(),
-            id: lastNotification.id,
-          })
-        : null;
-
-    return {
-      data,
-      pagination: {
-        limit: query.limit,
-        hasMore,
-        nextCursor,
-      },
-    };
+      return {
+        data,
+        pagination: {
+          limit: query.limit,
+          hasMore,
+          nextCursor,
+        },
+      };
+    });
   }
+
   async getNotificationById(notificationId: string, tenantId: string) {
-    const result = await this.database.query(
-      `
-    SELECT
-      id,
-      channel,
-      recipient,
-      message,
-      notification_type,
-      status,
-      attempts,
-      last_error,
-      provider_message_id,
-      created_at,
-      updated_at,
-      processed_at
-    FROM notifications
-    WHERE id = $1
-      AND tenant_id = $2
-    LIMIT 1
-    `,
-      [notificationId, tenantId],
-    );
+    return this.database.tenantTransaction(tenantId, async (client) => {
+      const result = await client.query(
+        `
+      SELECT
+        id,
+        channel,
+        recipient,
+        message,
+        notification_type,
+        status,
+        attempts,
+        last_error,
+        provider_message_id,
+        created_at
+      FROM notifications
+      WHERE id = $1
+        AND tenant_id = $2
+      LIMIT 1
+      `,
+        [notificationId, tenantId],
+      );
 
-    if (result.rows.length === 0) {
-      throw new NotFoundException('Notification not found.');
-    }
+      if (result.rows.length === 0) {
+        throw new NotFoundException('Notification not found.');
+      }
 
-    return result.rows[0];
+      return result.rows[0];
+    });
   }
 }

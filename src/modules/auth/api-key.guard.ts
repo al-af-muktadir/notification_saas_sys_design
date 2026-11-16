@@ -4,8 +4,10 @@ import {
   Injectable,
   UnauthorizedException,
 } from '@nestjs/common';
+
 import type { Request } from 'express';
-import { ApiKeyService, AuthenticatedTenant } from './api-key.service.js';
+
+import { ApiKeyService, type AuthenticatedTenant } from './api-key.service.js';
 
 export type AuthenticatedRequest = Request & {
   tenant: AuthenticatedTenant;
@@ -29,14 +31,13 @@ export class ApiKeyGuard implements CanActivate {
     if (!apiKey) {
       throw new UnauthorizedException('Invalid API key');
     }
-
-    const tenant = await this.apiKeyService.validateApiKey(apiKey);
+    console.log('Client IP:', request.ip);
+    const tenant = await this.apiKeyService.validateApiKey(apiKey, request.ip);
 
     if (!tenant) {
       throw new UnauthorizedException('Invalid or expired API key');
     }
 
-    // Attach the server-verified tenant identity.
     request.tenant = tenant;
 
     return true;

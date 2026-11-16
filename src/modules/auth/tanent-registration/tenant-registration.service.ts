@@ -23,23 +23,24 @@ export class TenantRegistrationService {
       // 2. Generate API key
       const prefix = randomBytes(6).toString('hex');
       const secret = randomBytes(32).toString('base64url');
-
       const apiKey = `ntf_live_${prefix}_${secret}`;
 
       // 3. Hash API key
       const keyHash = createHash('sha256').update(apiKey).digest('hex');
 
-      // 4. Store API key hash
+      // 4. Assign initial Production key permissions
+
+      // 5. Store API key hash and permissions
       await client.query(
         `
-        INSERT INTO tenant_api_keys
-          (tenant_id, name, key_prefix, key_hash)
-        VALUES ($1, $2, $3, $4)
-        `,
-        [tenant.id, 'Production', prefix, keyHash],
+  INSERT INTO tenant_api_keys
+    (tenant_id, name, key_prefix, key_hash, permissions)
+  VALUES ($1, $2, $3, $4, $5)
+  `,
+        [tenant.id, 'Production', prefix, keyHash, ['keys:manage']],
       );
 
-      // 5. Return plaintext key only once
+      // 6. Return plaintext key only once
       return {
         tenant: {
           id: tenant.id,
