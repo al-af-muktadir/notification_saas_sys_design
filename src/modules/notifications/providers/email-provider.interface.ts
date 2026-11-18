@@ -2,6 +2,7 @@ export interface SendEmailInput {
   to: string;
   subject: string;
   textContent: string;
+  idempotencyKey: string;
 }
 
 export interface SendEmailResult {

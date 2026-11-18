@@ -9,7 +9,7 @@ import amqp, {
   type ConfirmChannel,
   type ChannelModel,
   type Channel,
-  ConsumeMessage,
+  type ConsumeMessage,
 } from 'amqplib';
 
 const MAIN_EXCHANGE = 'notifications.main.exchange';
@@ -25,43 +25,86 @@ const RETRY_ROUTING_KEY = 'notifications.email.retry';
 const RETRY_DELAY = 35000;
 const MAX_ATTEMPTS = 3;
 
+type NotificationPayload = {
+  id: string;
+  channel: string;
+  recipient: string;
+  message: string;
+};
+
+type NotificationHandler = (
+  notification: NotificationPayload,
+  attempt: number,
+) => Promise<void>;
+
 @Injectable()
 export class RabbitMQService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(RabbitMQService.name);
+
   private connection!: ChannelModel;
   private channel!: ConfirmChannel;
   private consumerChannel!: Channel;
+
+  private consumerTag?: string;
+
+  // Tracks all notification handlers currently executing.
+  private readonly inFlightHandlers = new Set<Promise<void>>();
+
+  private isShuttingDown = false;
+
   async onModuleInit(): Promise<void> {
-    // 1. Create RabbitMQ connection
     this.connection = await amqp.connect('amqp://localhost:5672');
 
-    // 2. Create publisher ConfirmChannel
     this.channel = await this.connection.createConfirmChannel();
-
-    // 3. Create consumer channel
     this.consumerChannel = await this.connection.createChannel();
 
-    // 4. Configure exchanges and queues
     await this.setupNotificationQueues();
 
-    console.log('RabbitMQ initialized');
+    this.logger.log('RabbitMQ initialized');
   }
-  async onModuleDestroy(): Promise<void> {
-    console.log('Closing RabbitMQ connections...');
 
+  async onModuleDestroy(): Promise<void> {
+    this.logger.log('Starting RabbitMQ graceful shutdown...');
+
+    this.isShuttingDown = true;
+
+    // 1. Stop RabbitMQ from delivering new messages to this consumer.
+    if (this.consumerTag && this.consumerChannel) {
+      try {
+        await this.consumerChannel.cancel(this.consumerTag);
+        this.logger.log('RabbitMQ consumer cancelled');
+      } catch (error) {
+        this.logger.error('Failed to cancel RabbitMQ consumer', error);
+      }
+    }
+
+    // 2. Wait for already-running notification handlers.
+    while (this.inFlightHandlers.size > 0) {
+      this.logger.log(
+        `Waiting for ${this.inFlightHandlers.size} active notification handler(s)...`,
+      );
+
+      await Promise.allSettled([...this.inFlightHandlers]);
+    }
+
+    this.logger.log('All active notification handlers finished');
+
+    // 3. Close the consumer channel after handlers finish.
     if (this.consumerChannel) {
       await this.consumerChannel.close();
     }
 
+    // 4. Close the publisher channel.
     if (this.channel) {
       await this.channel.close();
     }
 
+    // 5. Close the connection.
     if (this.connection) {
       await this.connection.close();
     }
 
-    console.log('RabbitMQ connection closed');
+    this.logger.log('RabbitMQ connection closed');
   }
 
   getChannel(): ConfirmChannel {
@@ -71,35 +114,6 @@ export class RabbitMQService implements OnModuleInit, OnModuleDestroy {
 
     return this.channel;
   }
-
-  // async publishNotification(notification: {
-  //   id: string;
-  //   channel: string;
-  //   recipient: string;
-  //   message: string;
-  // }) {
-  //   const message = Buffer.from(JSON.stringify(notification));
-  //   const channel = this.getChannel();
-
-  //   const published = channel.publish(
-  //     MAIN_EXCHANGE,
-  //     MAIN_ROUTING_KEY,
-  //     message,
-  //     {
-  //       persistent: true,
-  //       contentType: 'application/json',
-  //       messageId: notification.id,
-  //     },
-  //   );
-
-  //   if (!published) {
-  //     this.logger.warn('RabbitMQ write buffer is full; waiting for drain');
-  //   }
-
-  //   await channel.waitForConfirms();
-
-  //   this.logger.log(`Notification ${notification.id} published and confirmed`);
-  // }
 
   async publishOutboxEvent(event: {
     id: string;
@@ -129,90 +143,121 @@ export class RabbitMQService implements OnModuleInit, OnModuleDestroy {
       });
     }
 
-    // Wait for RabbitMQ broker confirmation.
     await channel.waitForConfirms();
 
     this.logger.log(`Outbox event ${event.id} published and confirmed`);
   }
 
-  async consumeNotifications(
-    handler: (
-      notification: {
-        id: string;
-        channel: string;
-        recipient: string;
-        message: string;
-      },
-      attempt: number,
-    ) => Promise<void>,
-  ): Promise<void> {
+  async consumeNotifications(handler: NotificationHandler): Promise<void> {
     await this.consumerChannel.prefetch(10);
 
-    await this.consumerChannel.consume(
+    const result = await this.consumerChannel.consume(
       MAIN_QUEUE,
-      async (msg) => {
+      (msg) => {
         if (!msg) return;
-        let attempts = 0;
-        console.log(msg, 'this is my msg');
-        this.logger.log(
-          `RECEIVED: ${msg.properties.messageId} at ${new Date().toISOString()}`,
-        );
 
-        try {
-          const notification = JSON.parse(msg.content.toString());
-
-          const previousFailures = this.getPreviousFailures(msg);
-
-          attempts = previousFailures + 1;
-
-          await handler(notification, attempts);
-          this.logger.log(`ACK sent for notification ${notification.id}`);
-
-          this.consumerChannel.ack(msg);
-        } catch (error) {
-          console.error(
-            `Notification failed. Attempt ${attempts}/${MAX_ATTEMPTS}`,
-            error,
-          );
-
-          if (attempts >= MAX_ATTEMPTS) {
-            try {
-              // Publish failed message to DLQ
-              this.logger.error(
-                `MOVING TO DLQ: Attempt ${attempts} at ${new Date().toISOString()}`,
-              );
-              this.channel.publish(MAIN_EXCHANGE, DLQ_QUEUE, msg.content, {
-                persistent: true,
-                contentType: 'application/json',
-                headers: msg.properties.headers,
-              });
-
-              // Wait until RabbitMQ confirms DLQ publication
-              await this.channel.waitForConfirms();
-
-              // Original message can now be acknowledge
-              this.consumerChannel.ack(msg);
-
-              console.error('Notification moved to DLQ');
-            } catch (dlqError) {
-              console.error('Failed to publish to DLQ', dlqError);
-
-              // Keep the original message
-              this.consumerChannel.nack(msg, false, true);
-            }
-          } else {
-            // Main queue DLx routes it to retry queue
-            this.logger.warn(`Sending messagggggggg to retry queue`);
-            this.consumerChannel.nack(msg, false, false);
-          }
+        // If shutdown has started, leave this delivery unacknowledged.
+        // Closing the channel will make RabbitMQ redeliver it.
+        if (this.isShuttingDown) {
+          return;
         }
+
+        const task = this.handleMessage(msg, handler);
+
+        this.inFlightHandlers.add(task);
+
+        // Remove the task from the tracking set when it finishes.
+        void task.then(
+          () => this.inFlightHandlers.delete(task),
+          () => this.inFlightHandlers.delete(task),
+        );
       },
       { noAck: false },
     );
+
+    this.consumerTag = result.consumerTag;
+
+    this.logger.log(`Notification consumer started: ${this.consumerTag}`);
+  }
+
+  private async handleMessage(
+    msg: ConsumeMessage,
+    handler: NotificationHandler,
+  ): Promise<void> {
+    let attempts = 0;
+
+    this.logger.log(
+      `RECEIVED: ${msg.properties.messageId} at ${new Date().toISOString()}`,
+    );
+
+    try {
+      const notification = JSON.parse(
+        msg.content.toString(),
+      ) as NotificationPayload;
+
+      const previousFailures = this.getPreviousFailures(msg);
+
+      attempts = previousFailures + 1;
+
+      await handler(notification, attempts);
+
+      this.consumerChannel.ack(msg);
+
+      this.logger.log(`ACK sent for notification ${notification.id}`);
+    } catch (error) {
+      this.logger.error(
+        `Notification failed. Attempt ${attempts}/${MAX_ATTEMPTS}`,
+        error instanceof Error ? error.stack : String(error),
+      );
+
+      if (attempts >= MAX_ATTEMPTS) {
+        try {
+          this.logger.error(
+            `MOVING TO DLQ: Attempt ${attempts} at ${new Date().toISOString()}`,
+          );
+
+          const accepted = this.channel.publish(
+            MAIN_EXCHANGE,
+            DLQ_QUEUE,
+            msg.content,
+            {
+              persistent: true,
+              contentType: 'application/json',
+              messageId: msg.properties.messageId,
+              headers: msg.properties.headers,
+            },
+          );
+
+          if (!accepted) {
+            await new Promise<void>((resolve) => {
+              this.channel.once('drain', resolve);
+            });
+          }
+
+          // Confirm DLQ publication before acknowledging original.
+          await this.channel.waitForConfirms();
+
+          this.consumerChannel.ack(msg);
+
+          this.logger.error('Notification moved to DLQ');
+        } catch (dlqError) {
+          this.logger.error(
+            'Failed to publish to DLQ',
+            dlqError instanceof Error ? dlqError.stack : String(dlqError),
+          );
+
+          this.consumerChannel.nack(msg, false, true);
+        }
+      } else {
+        this.logger.warn('Sending message to retry queue');
+
+        // Main queue DLX routes the message to the retry queue.
+        this.consumerChannel.nack(msg, false, false);
+      }
+    }
   }
 
   private async setupNotificationQueues(): Promise<void> {
-    // 1. Create exchanges
     await this.channel.assertExchange(MAIN_EXCHANGE, 'direct', {
       durable: true,
     });
@@ -221,7 +266,6 @@ export class RabbitMQService implements OnModuleInit, OnModuleDestroy {
       durable: true,
     });
 
-    // 2. Main queue
     await this.channel.assertQueue(MAIN_QUEUE, {
       durable: true,
       arguments: {
@@ -230,7 +274,6 @@ export class RabbitMQService implements OnModuleInit, OnModuleDestroy {
       },
     });
 
-    // 3. Retry queue
     await this.channel.assertQueue(RETRY_QUEUE, {
       durable: true,
       arguments: {
@@ -240,20 +283,18 @@ export class RabbitMQService implements OnModuleInit, OnModuleDestroy {
       },
     });
 
-    // 4. Dead Letter Queue
-    await this.channel.assertQueue(DLQ_QUEUE, { durable: true });
+    await this.channel.assertQueue(DLQ_QUEUE, {
+      durable: true,
+    });
 
-    // 5. Bind main queue
     await this.channel.bindQueue(MAIN_QUEUE, MAIN_EXCHANGE, MAIN_ROUTING_KEY);
 
-    // 6. Bind retry queue
     await this.channel.bindQueue(
       RETRY_QUEUE,
       RETRY_EXCHANGE,
       RETRY_ROUTING_KEY,
     );
 
-    // 7. Bind DLQ
     await this.channel.bindQueue(DLQ_QUEUE, MAIN_EXCHANGE, DLQ_QUEUE);
   }
 

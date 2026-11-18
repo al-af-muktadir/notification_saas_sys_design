@@ -16,6 +16,13 @@ export class EmailProviderError extends Error {
   }
 }
 
+export class EmailProviderDuplicateError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'EmailProviderDuplicateError';
+  }
+}
+
 @Injectable()
 export class BrevoEmailProvider implements EmailProvider {
   async send(input: SendEmailInput): Promise<SendEmailResult> {
@@ -45,6 +52,10 @@ export class BrevoEmailProvider implements EmailProvider {
           to: [{ email: input.to }],
           subject: input.subject,
           textContent: input.textContent,
+          headers: {
+            idempotencyKey: input.idempotencyKey,
+            'X-Mailin-custom': input.idempotencyKey,
+          },
         }),
         signal: AbortSignal.timeout(10_000),
       });
@@ -60,6 +71,12 @@ export class BrevoEmailProvider implements EmailProvider {
     const responseBody = await response.text();
 
     if (!response.ok) {
+      if (responseBody.includes('duplicate_parameter')) {
+        throw new EmailProviderDuplicateError(
+          'Brevo has already processed this idempotency key',
+        );
+      }
+
       const retryable = response.status === 429 || response.status >= 500;
 
       throw new EmailProviderError(

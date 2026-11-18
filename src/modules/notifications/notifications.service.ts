@@ -5,8 +5,8 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { createHash, randomUUID } from 'node:crypto';
 
-import { createHash } from 'node:crypto';
 import { z } from 'zod';
 
 import type {
@@ -240,6 +240,8 @@ export class NotificationsService {
   // Create multiple notifications in one bulk request.
 
   // Create multiple notifications in one bulk request.
+
+  // Create multiple notifications in one bulk request.
   async createBulk(
     input: CreateBulkNotificationDto,
     idempotencyKey: string,
@@ -277,19 +279,29 @@ export class NotificationsService {
     const response = await this.database.tenantTransaction(
       tenantId,
       async (client) => {
-        // 1. Create the bulk request.
-        const bulkRequestResult = await client.query(
-          `INSERT INTO bulk_requests
-          (tenant_id, idempotency_key, request_hash)
-          VALUES ($1, $2, $3)
-          ON CONFLICT (tenant_id, idempotency_key)
-          DO NOTHING
-          RETURNING id`,
-          [tenantId, key, requestHash],
+        // 1. Generate the bulk request ID.
+        const bulkRequestId = randomUUID();
+
+        // 2. Register the idempotency key FIRST.
+        // This table owns the unique key across single and bulk endpoints.
+        const idempotencyResult = await client.query(
+          `INSERT INTO idempotency_keys
+           (
+             tenant_id,
+             idempotency_key,
+             operation_type,
+             request_hash,
+             resource_id
+           )
+           VALUES ($1, $2, 'bulk', $3, $4)
+           ON CONFLICT (tenant_id, idempotency_key)
+           DO NOTHING
+           RETURNING id`,
+          [tenantId, key, requestHash, bulkRequestId],
         );
 
-        // 2. If this bulk key already exists, retrieve its shared record.
-        if (bulkRequestResult.rows.length === 0) {
+        // 3. Handle an existing idempotency key.
+        if (idempotencyResult.rows.length === 0) {
           const existingResult = await client.query(
             `SELECT operation_type, request_hash, resource_id
              FROM idempotency_keys
@@ -316,10 +328,12 @@ export class NotificationsService {
             );
           }
 
+          // Retrieve the original bulk response.
           const existingBulkResult = await client.query(
             `SELECT response
              FROM bulk_requests
-             WHERE id = $1 AND tenant_id = $2`,
+             WHERE id = $1
+               AND tenant_id = $2`,
             [existing.resource_id, tenantId],
           );
 
@@ -335,51 +349,16 @@ export class NotificationsService {
           };
         }
 
-        const bulkRequestId = bulkRequestResult.rows[0].id;
-
-        // 3. Register this key in the shared namespace.
-        const idempotencyResult = await client.query(
-          `INSERT INTO idempotency_keys
-          (tenant_id, idempotency_key, operation_type, request_hash, resource_id)
-          VALUES ($1, $2, 'bulk', $3, $4)
-          ON CONFLICT (tenant_id, idempotency_key)
-          DO NOTHING
-          RETURNING id`,
-          [tenantId, key, requestHash, bulkRequestId],
+        // 4. Create bulk metadata after successfully claiming the key.
+        // Keep the old columns for now to remain compatible with the schema.
+        await client.query(
+          `INSERT INTO bulk_requests (
+  id,
+  tenant_id
+)
+VALUES ($1, $2)`,
+          [bulkRequestId, tenantId],
         );
-
-        // 4. The key may already belong to the single endpoint.
-        if (idempotencyResult.rows.length === 0) {
-          await client.query(
-            `DELETE FROM bulk_requests
-             WHERE id = $1 AND tenant_id = $2`,
-            [bulkRequestId, tenantId],
-          );
-
-          const existingResult = await client.query(
-            `SELECT operation_type
-             FROM idempotency_keys
-             WHERE tenant_id = $1
-               AND idempotency_key = $2`,
-            [tenantId, key],
-          );
-
-          const existing = existingResult.rows[0];
-
-          if (!existing) {
-            throw new Error('Existing idempotency record not found.');
-          }
-
-          if (existing.operation_type !== 'bulk') {
-            throw new ConflictException(
-              'This idempotency key has already been used for a single notification.',
-            );
-          }
-
-          throw new ConflictException(
-            'This idempotency key is already registered for another bulk request.',
-          );
-        }
 
         const results: BulkRecipientResult[] = [];
         const seenRecipients = new Set<string>();
@@ -419,16 +398,16 @@ export class NotificationsService {
           // 6. Create an individual notification.
           const notificationResult = await client.query(
             `INSERT INTO notifications
-            (
-              tenant_id,
-              channel,
-              recipient,
-              message,
-              notification_type,
-              bulk_request_id
-            )
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING id`,
+             (
+               tenant_id,
+               channel,
+               recipient,
+               message,
+               notification_type,
+               bulk_request_id
+             )
+             VALUES ($1, $2, $3, $4, $5, $6)
+             RETURNING id`,
             [
               tenantId,
               input.channel,
@@ -441,11 +420,11 @@ export class NotificationsService {
 
           const notification = notificationResult.rows[0];
 
-          // 7. Create its outbox event.
+          // 7. Create its outbox event in the same transaction.
           await client.query(
             `INSERT INTO outbox_events
-            (notification_id, routing_key, payload)
-            VALUES ($1, $2, $3::jsonb)`,
+             (notification_id, routing_key, payload)
+             VALUES ($1, $2, $3::jsonb)`,
             [
               notification.id,
               'notifications.email',

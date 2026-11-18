@@ -9,6 +9,8 @@
   "scripts": {
     "db:migrate": "psql -h 127.0.0.1 -U postgres -d notification_saas -v ON_ERROR_STOP=1 -f database/migrations/001_create_notifications.sql",
     "build": "nest build",
+    "start:worker:dev": "nest start --entryFile worker.main --watch",
+    "start:worker": "node dist/worker.main.js",
     "deploy": "nest deploy",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "start": "nest start",
